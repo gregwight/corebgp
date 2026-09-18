@@ -528,6 +528,33 @@ func (f *fsm) sendKeepAlive() error {
 	return err
 }
 
+// keepAliveTimerC returns the keepalive timer's channel, or nil if the
+// negotiated hold time is zero and there is no timer.
+//
+// RFC 4271 section 4.2 gives a hold time of zero the meaning "the connection
+// never expires and no KEEPALIVE messages are sent". Receiving from a nil
+// channel blocks forever, which is that behaviour in a select.
+func (f *fsm) keepAliveTimerC() <-chan time.Time {
+	if f.keepAliveTimer == nil {
+		return nil
+	}
+	return f.keepAliveTimer.C
+}
+
+// resetKeepAliveTimer restarts the keepalive timer if there is one.
+func (f *fsm) resetKeepAliveTimer() {
+	if f.keepAliveTimer != nil {
+		f.keepAliveTimer.Reset(f.keepAliveInterval)
+	}
+}
+
+// stopKeepAliveTimer stops the keepalive timer if there is one.
+func (f *fsm) stopKeepAliveTimer() {
+	if f.keepAliveTimer != nil {
+		f.keepAliveTimer.Stop()
+	}
+}
+
 func (f *fsm) drainAndResetHoldTimer() {
 	if !f.holdTimer.Stop() {
 		<-f.holdTimer.C
@@ -705,12 +732,12 @@ func (f *fsm) openConfirm() (fsmState, error) {
 				n := newNotification(NOTIF_CODE_HOLD_TIMER_EXPIRED, 0, nil)
 				f.sendNotification(n) // nolint: errcheck
 				return idleState, newNotificationError(n, true)
-			case <-f.keepAliveTimer.C:
+			case <-f.keepAliveTimerC():
 				err := f.sendKeepAlive()
 				if err != nil {
 					return idleState, fmt.Errorf("error sending keepAlive: %w", err)
 				}
-				f.keepAliveTimer.Reset(f.keepAliveInterval)
+				f.resetKeepAliveTimer()
 				continue
 			case err := <-f.readerErrCh:
 				// In OpenConfirm handling of a TCP connection fails event or
@@ -770,7 +797,7 @@ func (f *fsm) openConfirm() (fsmState, error) {
 	if to != establishedState {
 		f.cleanupConnAndReader()
 		f.holdTimer.Stop()
-		f.keepAliveTimer.Stop()
+		f.stopKeepAliveTimer()
 	}
 	return to, err
 }
@@ -820,9 +847,7 @@ func (f *fsm) established() (fsmState, error) {
 			case <-closeKAManagerCh:
 				return
 			case <-resetKATimerCh:
-				if f.holdTime != 0 {
-					f.keepAliveTimer.Reset(f.keepAliveInterval)
-				}
+				f.resetKeepAliveTimer()
 			}
 		}
 	}()
@@ -849,7 +874,7 @@ func (f *fsm) established() (fsmState, error) {
 				n := newNotification(NOTIF_CODE_HOLD_TIMER_EXPIRED, 0, nil)
 				f.sendNotification(n) // nolint: errcheck
 				return idleState, newNotificationError(n, true)
-			case <-f.keepAliveTimer.C:
+			case <-f.keepAliveTimerC():
 				err := f.sendKeepAlive()
 				if err != nil {
 					return idleState, fmt.Errorf("error sending keepAlive: %w", err)
@@ -948,7 +973,7 @@ func (f *fsm) established() (fsmState, error) {
 	to, err := established()
 	f.cleanupConnAndReader()
 	f.holdTimer.Stop()
-	f.keepAliveTimer.Stop()
+	f.stopKeepAliveTimer()
 	f.peer.plugin.OnClose(f.peer.config)
 	return to, err
 }
