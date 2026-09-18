@@ -20,6 +20,11 @@ type fsm struct {
 	remoteID uint32
 
 	// conn-related fields
+	//
+	// connMu guards assignment of conn, which the teardown watchdog started by
+	// run() reads via currentConn(). The FSM goroutine performs every
+	// assignment and reads conn directly elsewhere.
+	connMu       sync.Mutex
 	conn         net.Conn
 	dialResultCh chan *dialResult
 	cancelDialFn context.CancelFunc
@@ -55,6 +60,21 @@ func newFSM(peer *peer, conn net.Conn) *fsm {
 		idleHoldTimer: time.NewTimer(0),
 	}
 	return f
+}
+
+// setConn assigns the FSM's connection. Only the FSM goroutine calls it.
+func (f *fsm) setConn(conn net.Conn) {
+	f.connMu.Lock()
+	f.conn = conn
+	f.connMu.Unlock()
+}
+
+// currentConn returns the FSM's connection, or nil if it has none. It is safe
+// to call from goroutines other than the FSM's.
+func (f *fsm) currentConn() net.Conn {
+	f.connMu.Lock()
+	defer f.connMu.Unlock()
+	return f.conn
 }
 
 type fsmState uint8
@@ -104,10 +124,38 @@ func (f *fsm) cleanup() {
 	}
 }
 
+const (
+	// closeGracePeriod is how long teardown gives the FSM to shut the
+	// connection down itself before the watchdog in run() closes it.
+	closeGracePeriod = time.Second
+)
+
 func (f *fsm) run() {
 	defer func() {
 		f.cleanup()
 		close(f.doneCh)
+	}()
+
+	// The FSM's own writes share this goroutine with the state machine, so a
+	// write that blocks because the remote peer has stopped reading also stops
+	// closeCh from being observed, and stop() then waits on doneCh forever.
+	// Closing the connection is the only thing that frees a writer queued on
+	// the per-connection write lock, so a watchdog does it once teardown has
+	// been signalled and the FSM has failed to finish within the grace period.
+	// The grace period leaves a healthy peer's CEASE to the FSM.
+	go func() {
+		select {
+		case <-f.doneCh:
+			return
+		case <-f.closeCh:
+		}
+		select {
+		case <-f.doneCh:
+		case <-time.After(closeGracePeriod):
+			if c := f.currentConn(); c != nil {
+				c.Close()
+			}
+		}
 	}()
 
 	var t stateTransition
@@ -347,7 +395,7 @@ func (f *fsm) connect() fsmState {
 
 				A HoldTimer value of 4 minutes is suggested.
 			*/
-			f.conn = dr.conn
+			f.setConn(dr.conn)
 			f.connectRetryTimer.Stop()
 			return f.sendOpenAndSetHoldTimer()
 		case <-f.connectRetryTimer.C:
@@ -373,7 +421,7 @@ func (f *fsm) connect() fsmState {
 			}
 			// if dr.err == nil we ended up with an established connection
 			// during the race between connectRetryTimer and the dialer
-			f.conn = dr.conn
+			f.setConn(dr.conn)
 			return f.sendOpenAndSetHoldTimer()
 		}
 	}
@@ -424,7 +472,7 @@ func (f *fsm) startReading() {
 
 func (f *fsm) cleanupConnAndReader() {
 	defer func() {
-		f.conn = nil
+		f.setConn(nil)
 	}()
 	if f.conn != nil {
 		f.conn.Close()
